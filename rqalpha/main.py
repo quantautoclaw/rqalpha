@@ -20,7 +20,6 @@ import sys
 from pprint import pformat
 from itertools import chain
 
-import jsonpickle.ext.numpy as jsonpickle_numpy
 import logbook
 import six
 from rqalpha import const
@@ -43,7 +42,10 @@ from rqalpha.utils.log_capture import LogCapture
 from rqalpha.utils.logger import release_print, system_log, user_log, user_system_log
 from rqalpha.utils.persisit_helper import PersistHelper
 
-jsonpickle_numpy.register_handlers()
+# Deferred import — jsonpickle.ext.numpy registration is done inside run()
+# to avoid global state pollution that causes ACCESS_VIOLATION on Windows
+# when rqalpha.run_func() is called multiple times in the same process.
+_jsonpickle_numpy_registered = False
 
 
 def _adjust_start_date(config, data_proxy):
@@ -130,7 +132,48 @@ def init_rqdatac(rqdatac_uri):
             return
 
 
+def _register_jsonpickle_numpy() -> None:
+    """Register numpy handlers with jsonpickle (called once per run)."""
+    global _jsonpickle_numpy_registered
+    if not _jsonpickle_numpy_registered:
+        try:
+            import jsonpickle.ext.numpy as jpn
+            jpn.register_handlers()
+            _jsonpickle_numpy_registered = True
+        except Exception:
+            pass
+
+
+def _unregister_jsonpickle_numpy() -> None:
+    """Unregister numpy handlers from jsonpickle's global handler registry.
+    
+    This is critical on Windows: calling rqalpha.run_func() multiple times
+    in the same process can leave stale jsonpickle handler registrations
+    that cause ACCESS_VIOLATION (0xC0000005) crashes on subsequent runs.
+    """
+    global _jsonpickle_numpy_registered
+    if not _jsonpickle_numpy_registered:
+        return
+    try:
+        import jsonpickle
+        from jsonpickle.handlers import registry
+        # Reset the handler registry to prevent stale numpy handlers
+        # from being carried over across multiple run() invocations.
+        if hasattr(registry, 'clear'):
+            registry.clear()
+        elif hasattr(registry, '_handlers'):
+            registry._handlers.clear()
+        elif hasattr(registry, 'handlers'):
+            registry.handlers.clear()
+    except Exception:
+        pass
+    _jsonpickle_numpy_registered = False
+
+
 def run(config, source_code=None, user_funcs=None):
+    # Register numpy handlers for jsonpickle serialization within the run scope
+    # to avoid global state pollution across multiple run_func() calls.
+    _register_jsonpickle_numpy()
     env = Environment(config, init_rqdatac(getattr(config.base, 'rqdatac_uri', None)))
     persist_helper = None
     init_succeed = False
@@ -296,8 +339,14 @@ def output_profile_result(env):
 
 def cleanup_resources(env):
     """
-    清理资源，防止内存泄漏
+    清理资源，防止内存泄漏和跨运行状态污染
     在每次策略运行结束后调用，确保对象能被正确回收
+
+    Windows 兼容性修复：
+    1. jsonpickle.ext.numpy 的 handler 注册是全局副作用 — 如果在模块级别
+       注册，多次 run_func() 调用会在同一个 Python 进程中留下过期的 handler，
+       导致 ACCESS_VIOLATION (0xC0000005) 崩溃。
+    2. rqdatac 的全局状态也需要清理，防止"already initialized"错误。
     """
     # 1. 清理 Environment 单例引用
     Environment._env = None
@@ -314,6 +363,15 @@ def cleanup_resources(env):
         for property_name in ['_id_instrument_map', '_sym_instrument_map', '_grouped_instruments']:
             if hasattr(env.data_source, property_name):
                 getattr(env.data_source, property_name).clear()
+    # 4. 清理 jsonpickle numpy handler 注册（Windows 兼容性关键修复）
+    _unregister_jsonpickle_numpy()
+    # 5. 清理 rqdatac 全局状态，防止跨运行时 "already initialized" 冲突
+    try:
+        import rqdatac
+        if hasattr(rqdatac, '_initialized'):
+            rqdatac._initialized = False
+    except ImportError:
+        pass
 
 
 def set_loggers(config):
